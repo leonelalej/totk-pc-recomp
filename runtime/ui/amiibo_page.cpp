@@ -1,11 +1,13 @@
 // Amiibo / NFC menu page (Dear ImGui): browser and scan controls.
-#include <windows.h>
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <vector>
 #include <string>
-#include <algorithm>
+#include <string_view>
+#include <vector>
 
 #include "imgui.h"
 #include "ui/amiibo_page.h"
@@ -16,49 +18,80 @@ extern "C" {
 #include "platform/platform.h"
 }
 
+namespace fs = std::filesystem;
+
 struct FileEntry {
     std::string name;
     bool is_dir;
 };
 
-static std::string g_current_dir = "C:\\Users\\leone\\Music\\AMIIBO";
+static const char kDefaultAmiiboDir[] = "./amiibo";
+static std::string g_current_dir = kDefaultAmiiboDir;
+static char g_dir_input[512] = "./amiibo";
 static std::vector<FileEntry> g_entries;
 static int g_selected_entry = -1;
 static std::string g_status_msg = "Ready";
+
+static bool iequals(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void set_current_dir(const std::string &path) {
+    g_current_dir = path;
+    snprintf(g_dir_input, sizeof(g_dir_input), "%s", g_current_dir.c_str());
+    cfg_set("TOTK_AMIIBO_DIR", g_current_dir.c_str());
+}
 
 static void refresh_dir(void) {
     g_entries.clear();
     g_selected_entry = -1;
 
-    // Check custom setting if current dir is default and setting exists
-    const char *cfg_dir = cfg_get("TOTK_AMIIBO_DIR");
-    if (cfg_dir && *cfg_dir && g_current_dir == "C:\\Users\\leone\\Music\\AMIIBO") {
-        g_current_dir = cfg_dir;
+    std::error_code ec;
+    fs::path dir_path(g_current_dir);
+
+    // Fall back to "." if directory does not exist or is not a directory
+    if (!fs::exists(dir_path, ec) || !fs::is_directory(dir_path, ec)) {
+        if (g_current_dir != ".") {
+            set_current_dir(".");
+            dir_path = fs::path(g_current_dir);
+        }
     }
 
-    std::string pattern = g_current_dir + "\\*";
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) {
-        // Fallback to local if non-existent
-        g_current_dir = ".";
-        pattern = g_current_dir + "\\*";
-        h = FindFirstFileA(pattern.c_str(), &fd);
-        if (h == INVALID_HANDLE_VALUE) return;
+    if (!fs::exists(dir_path, ec) || !fs::is_directory(dir_path, ec)) {
+        g_status_msg = "Cannot open directory: " + g_current_dir;
+        return;
     }
 
-    do {
-        if (!strcmp(fd.cFileName, ".")) continue;
-        bool is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    // Add parent navigation if not at root
+    if (dir_path.has_parent_path() && dir_path != dir_path.parent_path()) {
+        g_entries.push_back({"..", true});
+    }
+
+    for (const auto &entry : fs::directory_iterator(dir_path, fs::directory_options::skip_permission_denied, ec)) {
+        if (ec) break;
+        std::error_code status_ec;
+        bool is_dir = entry.is_directory(status_ec);
+        if (status_ec) continue;
+
+        std::string filename = entry.path().filename().string();
+        if (filename.empty() || filename == "." || filename == "..") continue;
+
         if (!is_dir) {
-            const char *dot = strrchr(fd.cFileName, '.');
-            if (!dot || (_stricmp(dot, ".bin") != 0 && _stricmp(dot, ".nfc") != 0)) {
+            std::string ext = entry.path().extension().string();
+            if (!iequals(ext, ".bin") && !iequals(ext, ".nfc")) {
                 continue;
             }
         }
-        g_entries.push_back({fd.cFileName, is_dir});
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+
+        g_entries.push_back({std::move(filename), is_dir});
+    }
 
     std::sort(g_entries.begin(), g_entries.end(), [](const FileEntry &a, const FileEntry &b) {
         if (a.name == "..") return true;
@@ -71,6 +104,13 @@ static void refresh_dir(void) {
 void tab_amiibo(float scale) {
     static bool s_inited = false;
     if (!s_inited) {
+        const char *cfg_dir = cfg_get("TOTK_AMIIBO_DIR");
+        if (cfg_dir && *cfg_dir) {
+            g_current_dir = cfg_dir;
+        } else {
+            g_current_dir = kDefaultAmiiboDir;
+        }
+        snprintf(g_dir_input, sizeof(g_dir_input), "%s", g_current_dir.c_str());
         refresh_dir();
         s_inited = true;
     }
@@ -83,12 +123,21 @@ void tab_amiibo(float scale) {
     // ---- Left Pane: Explorer & List ----
     ImGui::BeginChild("##amiibo_explorer", ImVec2(left_w, content_h), true);
     ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1.0f), "Amiibo NFC Directory:");
-    ImGui::TextWrapped("%s", g_current_dir.c_str());
+
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+    if (ImGui::InputText("##amiibo_dir_input", g_dir_input, sizeof(g_dir_input), ImGuiInputTextFlags_EnterReturnsTrue)) {
+        set_current_dir(g_dir_input);
+        refresh_dir();
+    }
 
     ImGui::Spacing();
-    if (ImGui::Button("Browse 'C:\\Users\\leone\\Music\\AMIIBO'")) {
-        g_current_dir = "C:\\Users\\leone\\Music\\AMIIBO";
-        cfg_set("TOTK_AMIIBO_DIR", g_current_dir.c_str());
+    if (ImGui::Button("Set Directory")) {
+        set_current_dir(g_dir_input);
+        refresh_dir();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Default (./amiibo)")) {
+        set_current_dir(kDefaultAmiiboDir);
         refresh_dir();
     }
     ImGui::SameLine();
@@ -110,25 +159,20 @@ void tab_amiibo(float scale) {
             if (e.is_dir) {
                 if (ImGui::IsMouseDoubleClicked(0) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown)) {
                     if (e.name == "..") {
-                        size_t last_slash = g_current_dir.find_last_of("\\/");
-                        if (last_slash != std::string::npos && last_slash > 2) {
-                            g_current_dir = g_current_dir.substr(0, last_slash);
-                        } else if (last_slash != std::string::npos && last_slash == 2) {
-                            g_current_dir = g_current_dir.substr(0, 3);
+                        fs::path cur(g_current_dir);
+                        if (cur.has_parent_path() && cur != cur.parent_path()) {
+                            set_current_dir(cur.parent_path().string());
+                        } else {
+                            set_current_dir(".");
                         }
                     } else {
-                        if (g_current_dir.back() == '\\' || g_current_dir.back() == '/') {
-                            g_current_dir += e.name;
-                        } else {
-                            g_current_dir += "\\" + e.name;
-                        }
+                        set_current_dir((fs::path(g_current_dir) / e.name).string());
                     }
-                    cfg_set("TOTK_AMIIBO_DIR", g_current_dir.c_str());
                     refresh_dir();
                     break;
                 }
             } else {
-                std::string full_path = g_current_dir + "\\" + e.name;
+                std::string full_path = (fs::path(g_current_dir) / e.name).string();
                 if (ImGui::IsMouseDoubleClicked(0)) {
                     if (amiibo_scan_and_tap(full_path.c_str())) {
                         g_status_msg = "Scanned & Tapped: " + e.name;
@@ -171,7 +215,7 @@ void tab_amiibo(float scale) {
         ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.4f, 1.0f), "%s", g_entries[g_selected_entry].name.c_str());
 
         if (ImGui::Button("Scan / Tap Amiibo", ImVec2(ImGui::GetContentRegionAvail().x, 32 * scale))) {
-            std::string full_path = g_current_dir + "\\" + g_entries[g_selected_entry].name;
+            std::string full_path = (fs::path(g_current_dir) / g_entries[g_selected_entry].name).string();
             if (amiibo_scan_and_tap(full_path.c_str())) {
                 g_status_msg = "Tapped " + g_entries[g_selected_entry].name;
             } else {

@@ -24,6 +24,37 @@ static float g_auto_remove_delay_s = 2.5f;
 static uint64_t g_tap_timestamp_ns = 0;
 static bool g_timer_active = false;
 
+static bool amiibo_validate_dump(const uint8_t *data, uint64_t size) {
+    if (size != AMIIBO_DUMP_SIZE) {
+        return false;
+    }
+
+    // NTAG215 Capability Container (CC) at page 3 (offset 0x0C).
+    // Byte 0x0C must be 0xE1 (NDEF Magic / Type 2 Tag CC container byte).
+    if (data[0x0C] != 0xE1) {
+        return false;
+    }
+
+    // UID sanity: UID (bytes 0..2 and 4..7) cannot be all zeroes or all 0xFF.
+    if ((data[0] == 0 && data[1] == 0 && data[2] == 0 && data[4] == 0 &&
+         data[5] == 0 && data[6] == 0 && data[7] == 0) ||
+        (data[0] == 0xFF && data[1] == 0xFF && data[2] == 0xFF && data[4] == 0xFF &&
+         data[5] == 0xFF && data[6] == 0xFF && data[7] == 0xFF)) {
+        return false;
+    }
+
+    // ISO 14443-3 / NTAG215 Bit Check Character (BCC) verification.
+    // Page 0 byte 3 (BCC0) = 0x88 ^ UID[0] ^ UID[1] ^ UID[2]
+    // Page 2 byte 0 (BCC1) = UID[3] ^ UID[4] ^ UID[5] ^ UID[6]
+    uint8_t bcc0 = (uint8_t)(0x88 ^ data[0] ^ data[1] ^ data[2]);
+    uint8_t bcc1 = (uint8_t)(data[4] ^ data[5] ^ data[6] ^ data[7]);
+    if (data[3] != bcc0 || data[8] != bcc1) {
+        return false;
+    }
+
+    return true;
+}
+
 static void parse_dump_info(const char *path) {
     memset(&g_info, 0, sizeof(g_info));
     if (path) {
@@ -31,6 +62,9 @@ static void parse_dump_info(const char *path) {
         const char *slash = strrchr(path, '\\');
         const char *fslash = strrchr(path, '/');
         const char *name = slash ? slash + 1 : (fslash ? fslash + 1 : path);
+        if (slash && fslash) {
+            name = (slash > fslash ? slash : fslash) + 1;
+        }
         snprintf(g_info.filename, sizeof(g_info.filename), "%s", name);
     }
 
@@ -149,8 +183,14 @@ bool amiibo_load_file(const char *path) {
         rt_log("amiibo: failed to read file: %s", path);
         return false;
     }
-    if (size < AMIIBO_DUMP_SIZE) {
-        rt_log("amiibo: file too small (%llu bytes, expected >= 540): %s", (unsigned long long)size, path);
+    if (size != AMIIBO_DUMP_SIZE) {
+        rt_log("amiibo: invalid dump size (%llu bytes, expected exactly %d): %s",
+               (unsigned long long)size, AMIIBO_DUMP_SIZE, path);
+        free(data);
+        return false;
+    }
+    if (!amiibo_validate_dump(data, size)) {
+        rt_log("amiibo: dump failed NTAG215 structure sanity checks: %s", path);
         free(data);
         return false;
     }
